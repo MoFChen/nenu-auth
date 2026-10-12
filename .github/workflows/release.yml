@@ -1,0 +1,324 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: '1.4.3'
+  UPX_VERSION: '5.2.1'
+  ENABLE_UPX: 'true'
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: bun-linux-x64
+            binary: nenu-auth
+            upx_asset: amd64_linux.tar.xz
+            upx_sha256: 402162aad30af47e60dbd767fb2e64ca394ace9727ba1f40283641f1d1b91657
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: bun-linux-arm64
+            binary: nenu-auth
+            upx_asset: arm64_linux.tar.xz
+            upx_sha256: a72d112c5970a904a31da0b9c84f919bc16b9a311787c12245508544a78c7d36
+          - platform: linux-x64-musl
+            runner: ubuntu-24.04
+            target: bun-linux-x64-musl
+            binary: nenu-auth
+            upx_asset: amd64_linux.tar.xz
+            upx_sha256: 402162aad30af47e60dbd767fb2e64ca394ace9727ba1f40283641f1d1b91657
+          - platform: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            target: bun-linux-arm64-musl
+            binary: nenu-auth
+            upx_asset: arm64_linux.tar.xz
+            upx_sha256: a72d112c5970a904a31da0b9c84f919bc16b9a311787c12245508544a78c7d36
+          - platform: windows-x64
+            runner: windows-2022
+            target: bun-windows-x64
+            binary: nenu-auth.exe
+            upx_asset: win64.zip
+            upx_sha256: eabc6792a347d45e945be7748423e7868fd01b0d2bcaa2f4b1031fd71ff69bda
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: bun-windows-arm64
+            binary: nenu-auth.exe
+            upx_asset: ''
+            upx_sha256: ''
+          - platform: darwin-x64
+            runner: macos-15-intel
+            target: bun-darwin-x64
+            binary: nenu-auth
+            upx_asset: ''
+            upx_sha256: ''
+          - platform: darwin-arm64
+            runner: macos-15
+            target: bun-darwin-arm64
+            binary: nenu-auth
+            upx_asset: ''
+            upx_sha256: ''
+
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+      UPX_ASSET: ${{ matrix.upx_asset }}
+      UPX_SHA256: ${{ matrix.upx_sha256 }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Build, verify, optimize and package
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import lzma
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import urllib.request
+          import zipfile
+
+          root = Path.cwd()
+          dist = root / 'dist'
+          dist.mkdir(exist_ok=True)
+          platform = os.environ['PLATFORM']
+          version = json.loads((root / 'package.json').read_text(encoding='utf-8'))['version']
+          is_release = os.environ['GITHUB_EVENT_NAME'] == 'push'
+          if is_release:
+              tag = os.environ['GITHUB_REF_NAME']
+              match = re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?', tag)
+              if not match or tag[1:] != version:
+                  sys.exit('Release tag must be v<package.json version>, e.g. v1.0.0 or v1.0.0-beta.1')
+              if match[4] and any(p.isdigit() and len(p) > 1 and p.startswith('0') for p in match[4].split('.')):
+                  sys.exit('Numeric prerelease identifiers must not have leading zeroes')
+              label = tag
+          else:
+              label = 'dev-' + os.environ['GITHUB_SHA'][:7]
+
+          binary = dist / os.environ['BINARY']
+          subprocess.run([
+              'bun', 'build', './nenu-auth.js', '--compile', '--minify',
+              '--no-compile-autoload-dotenv', '--no-compile-autoload-bunfig',
+              '--target', os.environ['TARGET'], '--outfile', str(binary),
+          ], check=True)
+          raw_size = binary.stat().st_size
+          musl = platform.endswith('-musl')
+          if musl:
+              subprocess.run(['docker', 'pull', 'alpine:3.22'], check=True, timeout=180)
+
+          def smoke(path):
+              # Use an empty working directory without node_modules or source files.
+              with tempfile.TemporaryDirectory() as isolated:
+                  def run(*args):
+                      command = [str(path), *args]
+                      if musl:
+                          command = [
+                              'docker', 'run', '--rm', '--network=none',
+                              '--volume', str(dist) + ':/work:ro', '--workdir', '/tmp',
+                              'alpine:3.22', '/work/' + path.name, *args,
+                          ]
+                      return subprocess.run(command, cwd=isolated, capture_output=True, text=True, timeout=30)
+                  result = run('--version')
+                  if result.returncode != 0 or result.stdout.strip() != version:
+                      raise RuntimeError('CLI version check failed: ' + result.stdout + result.stderr)
+                  result = run('--help')
+                  if result.returncode != 0 or 'Usage: nenu-auth' not in result.stdout or '--username' not in result.stdout:
+                      raise RuntimeError('CLI help check failed: ' + result.stdout + result.stderr)
+                  result = run('-u', 'build-test', '-p', 'dummy-password', '--os', 'invalid-os')
+                  if result.returncode != 1 or 'Invalid operating system specified.' not in result.stderr:
+                      raise RuntimeError('CLI argument check failed: ' + result.stdout + result.stderr)
+
+          smoke(binary)
+
+          def optimize(name, transform):
+              candidate = dist / (name + '-' + binary.name)
+              shutil.copy2(binary, candidate)
+              try:
+                  transform(candidate)
+                  smoke(candidate)
+                  if candidate.stat().st_size < binary.stat().st_size:
+                      candidate.replace(binary)
+                      print('Applied ' + name + ': ' + str(binary.stat().st_size) + ' bytes')
+              except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                  print('::warning::' + name + ' skipped; keeping verified binary. ' + str(error).replace('\n', ' '))
+              finally:
+                  candidate.unlink(missing_ok=True)
+
+          if platform.startswith(('linux-', 'darwin-')):
+              def strip_symbols(path):
+                  flag = '--strip-debug' if platform.startswith('linux-') else '-S'
+                  subprocess.run(['strip', flag, str(path)], check=True)
+                  if platform.startswith('darwin-'):
+                      subprocess.run(['codesign', '--force', '--sign', '-', str(path)], check=True)
+              optimize('strip', strip_symbols)
+
+          upx_asset = os.environ['UPX_ASSET']
+          if os.environ['ENABLE_UPX'] == 'true' and upx_asset:
+              try:
+                  upx_version = os.environ['UPX_VERSION']
+                  archive_name = 'upx-' + upx_version + '-' + upx_asset
+                  url = 'https://github.com/upx/upx/releases/download/v' + upx_version + '/' + archive_name
+                  with urllib.request.urlopen(url, timeout=60) as response:
+                      data = response.read()
+                  if hashlib.sha256(data).hexdigest() != os.environ['UPX_SHA256']:
+                      raise RuntimeError('UPX download SHA-256 mismatch')
+                  with tempfile.TemporaryDirectory() as temporary:
+                      archive = Path(temporary) / archive_name
+                      archive.write_bytes(data)
+                      if upx_asset.endswith('.zip'):
+                          tool = Path(temporary) / 'upx.exe'
+                          with zipfile.ZipFile(archive) as packed:
+                              tool.write_bytes(packed.read(archive_name[:-4] + '/upx.exe'))
+                      else:
+                          tool = Path(temporary) / 'upx'
+                          with tarfile.open(archive, 'r:xz') as packed:
+                              tool.write_bytes(packed.extractfile(archive_name[:-7] + '/upx').read())
+                          tool.chmod(0o755)
+                      def compress(path):
+                          subprocess.run([str(tool), '--best', '--lzma', '--overlay=copy', str(path)], check=True, timeout=600)
+                      optimize('upx', compress)
+              except (OSError, RuntimeError, KeyError, tarfile.TarError, zipfile.BadZipFile) as error:
+                  print('::warning::UPX unavailable; keeping verified binary. ' + str(error).replace('\n', ' '))
+
+          smoke(binary)
+          name = 'nenu-auth-' + label + '-' + platform
+          with tempfile.TemporaryDirectory() as temporary:
+              stage = Path(temporary) / name
+              stage.mkdir()
+              shutil.copy2(binary, stage / binary.name)
+              if not platform.startswith('windows-'):
+                  (stage / binary.name).chmod(0o755)
+              shutil.copy2(root / 'README.md', stage / 'README.md')
+              if (root / 'LICENSE').is_file():
+                  shutil.copy2(root / 'LICENSE', stage / 'LICENSE')
+              notices = []
+              license_url = 'https://raw.githubusercontent.com/oven-sh/bun/bun-v' + os.environ['BUN_VERSION'] + '/LICENSE.md'
+              with urllib.request.urlopen(license_url, timeout=60) as response:
+                  notices.append('Bun runtime\n' + license_url + '\n\n' + response.read().decode('utf-8'))
+              for dependency in ('commander', 'read', 'mute-stream'):
+                  # Resolve both hoisted and isolated node_modules layouts.
+                  directories = (
+                      root / 'node_modules' / dependency,
+                      (root / 'node_modules' / 'read').resolve().parent / dependency,
+                      root / 'node_modules' / 'read' / 'node_modules' / dependency,
+                  )
+                  license_path = next((d / p for d in directories for p in ('LICENSE', 'LICENSE.md', 'LICENSE.txt') if (d / p).is_file()), None)
+                  if license_path is None:
+                      sys.exit('Missing license for ' + dependency)
+                  notices.append(dependency + '\n\n' + license_path.read_text(encoding='utf-8'))
+              (stage / 'THIRD_PARTY_LICENSES.txt').write_text('\n\n' + ('\n\n' + '=' * 72 + '\n\n').join(notices), encoding='utf-8')
+              if platform.startswith('windows-'):
+                  output = dist / (name + '.zip')
+                  with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+                      for path in sorted(stage.iterdir()):
+                          archive.write(path, arcname=name + '/' + path.name)
+              else:
+                  output = dist / (name + '.tar.xz')
+                  with tarfile.open(output, 'w:xz', preset=9 | lzma.PRESET_EXTREME) as archive:
+                      archive.add(stage, arcname=name)
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('| Target | Original binary | Final binary | Download archive |\n| --- | ---: | ---: | ---: |\n')
+              summary.write(f'| {platform} | {raw_size / 1048576:.2f} MiB | {binary.stat().st_size / 1048576:.2f} MiB | {output.stat().st_size / 1048576:.2f} MiB |\n')
+          PY
+
+      - name: Upload packaged program
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nenu-auth-${{ matrix.platform }}
+          path: |
+            dist/*.tar.xz
+            dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: nenu-auth-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA-256 checksums
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          directory = Path('dist')
+          packages = sorted([*directory.glob('*.tar.xz'), *directory.glob('*.zip')])
+          if len(packages) != 8:
+              raise SystemExit(f'Expected 8 platform packages, found {len(packages)}')
+          with (directory / 'SHA256SUMS').open('w', encoding='utf-8', newline='\n') as output:
+              for package in packages:
+                  with package.open('rb') as source:
+                      digest = hashlib.file_digest(source, 'sha256').hexdigest()
+                  output.write(digest + '  ' + package.name + '\n')
+          PY
+
+      - name: Upload assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=false
+          if [[ "$TAG" == *-* ]]; then
+            prerelease=true
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --draft \
+              --title "nenu-auth $TAG" --generate-notes --prerelease="$prerelease"
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --prerelease="$prerelease"
