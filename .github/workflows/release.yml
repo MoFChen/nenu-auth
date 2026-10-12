@@ -142,8 +142,14 @@ jobs:
           ], check=True)
           raw_size = binary.stat().st_size
           musl = platform.endswith('-musl')
+          musl_image = 'nenu-auth-musl-smoke:local'
           if musl:
-              subprocess.run(['docker', 'pull', 'alpine:3.22'], check=True, timeout=180)
+              # Bun's musl runtime dynamically links the system C++ libraries.
+              # Install them once before running checks with networking disabled.
+              subprocess.run([
+                  'docker', 'build', '--pull', '--tag', musl_image, '-',
+              ], input='FROM alpine:3.22\nRUN apk add --no-cache libgcc libstdc++\n',
+                  text=True, check=True, timeout=300)
 
           def smoke(path):
               # Use an empty working directory without node_modules or source files.
@@ -154,7 +160,7 @@ jobs:
                           command = [
                               'docker', 'run', '--rm', '--network=none',
                               '--volume', str(dist) + ':/work:ro', '--workdir', '/tmp',
-                              'alpine:3.22', '/work/' + path.name, *args,
+                              musl_image, '/work/' + path.name, *args,
                           ]
                       return subprocess.run(command, cwd=isolated, capture_output=True, text=True, timeout=30)
                   result = run('--version')
