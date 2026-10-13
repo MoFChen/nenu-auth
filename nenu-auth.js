@@ -261,7 +261,7 @@ async function main() {
 
     program
         .name('nenu-auth')
-        .version('1.0.0')
+        .version('1.0.3')
         .option('-u, --username <username>', 'UID, Student ID')
         .option('-p, --password <password>', 'Password (if not provided, it will be read from the stdin)')
         .option('-s, --os <os>', 'Specify operating system. \tValues: Windows 11, Windows 10, Windows NT, Mac OS, iOS, Unix, Linux, FreeBSD, Android.', 'Linux')
